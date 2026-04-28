@@ -1,0 +1,1275 @@
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+
+// ============================================================
+// CONSTANTS & CONFIG
+// ============================================================
+const TPA_COORD = [-6.3426, 106.9838];
+const EMISSION_FACTOR = 2.31; // kg CO2 per liter solar
+
+const WAYPOINTS = {
+  trk1: [[-6.2425, 106.8436], [-6.2458, 106.8791], [-6.2520, 106.9634], [-6.2625, 106.9945], TPA_COORD],
+  trk2: [[-6.2458, 106.8791], [-6.1950, 106.8750], [-6.1550, 106.8900], [-6.1200, 106.8800]],
+  trk3: [[-6.2425, 106.8436], [-6.2458, 106.8791], [-6.2480, 106.9000]],
+  trk4: [[-6.3000, 107.0500], [-6.3150, 107.0200], [-6.3250, 106.9900], TPA_COORD],
+};
+
+const interpolatePath = (path, totalSteps = 200) => {
+  if (!path || path.length < 2) return path || [];
+  const newPath = [];
+  let totalDist = 0;
+  const dists = [];
+  for (let i = 0; i < path.length - 1; i++) {
+    const d = Math.hypot(path[i+1][0]-path[i][0], path[i+1][1]-path[i][1]);
+    dists.push(d); totalDist += d;
+  }
+  if (totalDist === 0) return path;
+  for (let i = 0; i < path.length - 1; i++) {
+    const steps = Math.max(1, Math.round((dists[i]/totalDist)*totalSteps));
+    for (let s = 0; s < steps; s++) {
+      const t = s/steps;
+      newPath.push([path[i][0]+(path[i+1][0]-path[i][0])*t, path[i][1]+(path[i+1][1]-path[i][1])*t]);
+    }
+  }
+  newPath.push(path[path.length-1]);
+  return newPath;
+};
+
+const fetchOSRMRoute = async (waypoints, steps=300) => {
+  try {
+    const coords = waypoints.map(w=>`${w[1]},${w[0]}`).join(';');
+    const res = await fetch(`https://router.project-osrm.org/route/v1/driving/${coords}?overview=full&geometries=geojson`, {signal: AbortSignal.timeout(6000)});
+    if (!res.ok) throw new Error('OSRM error');
+    const data = await res.json();
+    if (data.code === 'Ok') return interpolatePath(data.routes[0].geometry.coordinates.map(c=>[c[1],c[0]]), steps);
+  } catch { /* fallback */ }
+  return interpolatePath(waypoints, steps);
+};
+
+// ============================================================
+// MOCK DATA
+// ============================================================
+const INITIAL_FLEETS = [
+  { id:'TRK-001', plate:'B 1234 CD', driver:'Budi Santoso', zone:'Jakarta Selatan', status:'normal', waypoints:WAYPOINTS.trk1, path:interpolatePath(WAYPOINTS.trk1), progress:0, lat:WAYPOINTS.trk1[0][0], lng:WAYPOINTS.trk1[0][1], speed:45, optimalDistance:15, actualDistance:0, fuelEff:0.20, health:95, trips:3, capacity:6, activeTime:0, idleTime:0 },
+  { id:'TRK-002', plate:'D 5678 EF', driver:'Ahmad Yani', zone:'Bekasi Utara', status:'deviation',waypoints:WAYPOINTS.trk2, path:interpolatePath(WAYPOINTS.trk2), progress:0, lat:WAYPOINTS.trk2[0][0], lng:WAYPOINTS.trk2[0][1], speed:60, optimalDistance:12, actualDistance:0, fuelEff:0.25, health:45, trips:2, capacity:6, activeTime:0, idleTime:0 },
+  { id:'TRK-003', plate:'F 9101 GH', driver:'Catur Pamungkas',zone:'Depok Timur', status:'broken', waypoints:WAYPOINTS.trk3, path:interpolatePath(WAYPOINTS.trk3), progress:0, lat:WAYPOINTS.trk3[0][0], lng:WAYPOINTS.trk3[0][1], speed:0, optimalDistance:18, actualDistance:0, fuelEff:0.20, health:15, trips:0, capacity:6, activeTime:0, idleTime:0 },
+  { id:'TRK-004', plate:'B 3321 XY', driver:'Dedi Irawan', zone:'Bekasi Selatan', status:'normal', waypoints:WAYPOINTS.trk4, path:interpolatePath(WAYPOINTS.trk4), progress:0, lat:WAYPOINTS.trk4[0][0], lng:WAYPOINTS.trk4[0][1], speed:40, optimalDistance:20, actualDistance:0, fuelEff:0.22, health:75, trips:2, capacity:6, activeTime:0, idleTime:0 },
+];
+
+const TPA_DATA = { name:'TPA Bantar Gebang', capacity:5000, currentLoad:4250, queueCount:18, waitTime:45 };
+
+const MAINTENANCE_DATA = [
+  { id:'TRK-001', plate:'B 1234 CD', health:95, prob:2, nextService:'12 Mei 2026', component:'Semua Sistem Normal', status:'good', mileage:124500, lastService:'12 Feb 2026' },
+  { id:'TRK-004', plate:'B 3321 XY', health:75, prob:15, nextService:'20 Jun 2026', component:'Ganti Oli Mesin', status:'warning', mileage:98200, lastService:'15 Jan 2026' },
+  { id:'TRK-002', plate:'D 5678 EF', health:45, prob:65, nextService:'Segera', component:'Kanvas Rem Kritis', status:'danger', mileage:210400, lastService:'10 Nov 2025' },
+  { id:'TRK-003', plate:'F 9101 GH', health:15, prob:95, nextService:'Kritis (Mogok)',component:'Radiator Bocor + Aki', status:'critical',mileage:315000, lastService:'5 Okt 2025' },
+];
+
+const LEADERBOARD = [
+  { rank:1, name:'Budi Santoso', score:98, carbonSaved:12.5, violations:0, streak:14, badge:'🏆' },
+  { rank:2, name:'Dedi Irawan', score:92, carbonSaved:8.2, violations:0, streak:7, badge:'🥈' },
+  { rank:3, name:'Ahmad Yani', score:65, carbonSaved:-5.0, violations:2, streak:0, badge:'⚠️' },
+  { rank:4, name:'Catur Pamungkas', score:45, carbonSaved:0.0, violations:1, streak:0, badge:'🔧' },
+];
+
+const HISTORY_EVENTS = [
+  { coord:[-6.2000,106.8100], time:'08:00', title:'Mulai Shift – Depot Kebayoran', type:'normal' },
+  { coord:[-6.2400,106.8500], time:'09:15', title:'Selesai Angkut Sektor A', type:'normal' },
+  { coord:[-6.2600,106.8800], time:'10:30', title:'ANOMALI: Berhenti Tidak Wajar 30 mnt', type:'deviation' },
+  { coord:[-6.3000,106.9400], time:'11:45', title:'Terjebak Macet – Tol JORR', type:'warning' },
+  { coord:TPA_COORD, time:'13:10', title:'Tiba di TPA Bantar Gebang', type:'normal' },
+];
+
+// 30 days historical data
+const generateHistorical = () => {
+  const data = [];
+  const now = new Date();
+  for (let i=29; i>=0; i--) {
+    const d = new Date(now); d.setDate(d.getDate()-i);
+    const wk = d.getDay()===0||d.getDay()===6;
+    const m = wk ? 0.65 : 1.15;
+    const f1=Math.round((Math.random()*5+12)*m), f2=Math.round((Math.random()*8+16)*m), f3=Math.round((Math.random()*3+8)*m), f4=Math.round((Math.random()*5+14)*m);
+    const tot=f1+f2+f3+f4;
+    const violations=Math.random()>0.65?Math.floor(Math.random()*3)+1:0;
+    data.push({
+      date:d.toLocaleDateString('id-ID',{weekday:'short',day:'numeric',month:'short'}),
+      shortDate:d.toLocaleDateString('id-ID',{day:'numeric',month:'short'}),
+      dayOfWeek:d.getDay(),
+      fuel_trk1:f1, fuel_trk2:f2, fuel_trk3:f3, fuel_trk4:f4,
+      totalFuel:tot,
+      carbonActual:Math.round(tot*EMISSION_FACTOR+Math.random()*20),
+      carbonOptimal:Math.round(tot*EMISSION_FACTOR-18),
+      tpaQueue:Math.round((Math.random()*20+10)*m),
+      violations,
+      trips:Math.round((Math.random()*4+8)*m),
+      avgSpeed:Math.round(35+Math.random()*20),
+      fuelCost:Math.round(tot*14000), // Rp 14.000/liter
+    });
+  }
+  return data;
+};
+const HISTORICAL = generateHistorical();
+
+// ============================================================
+// ICONS (inline SVG components)
+// ============================================================
+const Icon = ({ d, size=16, className='', strokeWidth=1.8 }) => (
+  <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={strokeWidth} strokeLinecap="round" strokeLinejoin="round" className={className}>
+    <path d={d}/>
+  </svg>
+);
+
+const Icons = {
+  Truck: () => <Icon d="M1 3h15v13H1zM16 8h4l3 3v5h-7V8zM5.5 21a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5zM18.5 21a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5z"/>,
+  Alert: () => <Icon d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0zM12 9v4M12 17h.01"/>,
+  Map: () => <Icon d="M1 6v16l7-4 8 4 7-4V2l-7 4-8-4-7 4zM8 2v16M16 6v16"/>,
+  Chart: () => <Icon d="M18 20V10M12 20V4M6 20v-6"/>,
+  Leaf: () => <Icon d="M17 8C8 10 5.9 16.17 3.82 19.11a1.003 1.003 0 0 0 1.82.75 6.97 6.97 0 0 0 .98-2.37C7.02 14.6 12 13 12 13s-4 4-2.5 9C10 24 14.5 24 15 21.5c.5-2.5-3-5-3-5s6 2 6-4c0-5.77-4.5-7-6-7-.22 0-.43.02-.65.06A7 7 0 0 1 17 8z"/>,
+  Settings: () => <Icon d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>,
+  Activity: () => <Icon d="M22 12h-4l-3 9L9 3l-3 9H2"/>,
+  Trophy: () => <Icon d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6M18 9h1.5a2.5 2.5 0 0 0 0-5H18M4 22h16M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22M18 2H6v7a6 6 0 0 0 12 0V2z"/>,
+  History: () => <Icon d="M12 8v4l3 3M3.05 11a9 9 0 1 0 .5-4.5L1 9M1 3v6h6"/>,
+  Wifi: () => <Icon d="M5 12.55a11 11 0 0 1 14.08 0M1.42 9a16 16 0 0 1 21.16 0M8.53 16.11a6 6 0 0 1 6.95 0M12 20h.01"/>,
+  X: () => <Icon d="M18 6 6 18M6 6l12 12"/>,
+  Check: () => <Icon d="M20 6 9 17l-5-5"/>,
+  Play: () => <Icon d="M5 3l14 9-14 9V3z"/>,
+  Pause: () => <Icon d="M6 4h4v16H6zM14 4h4v16h-4"/>,
+  Droplet: () => <Icon d="M12 2L5.5 8.5a6.5 6.5 0 0 0 13 0L12 2z"/>,
+  TrendUp: () => <Icon d="m22 7-8.5 8.5-5-5L2 17M22 7h-6M22 7v6"/>,
+  Bot: () => <Icon d="M12 2a2 2 0 0 1 2 2c0 .74-.4 1.39-1 1.73V7h1a7 7 0 0 1 7 7h1a1 1 0 0 1 1 1v3a1 1 0 0 1-1 1h-1v1a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-1H2a1 1 0 0 1-1-1v-3a1 1 0 0 1 1-1h1a7 7 0 0 1 7-7h1V5.73c-.6-.34-1-.99-1-1.73a2 2 0 0 1 2-2zM9 14a1 1 0 1 0 0 2 1 1 0 0 0 0-2zm6 0a1 1 0 1 0 0 2 1 1 0 0 0 0-2z"/>,
+  Send: () => <Icon d="M22 2 11 13M22 2 15 22l-4-9-9-4 20-7z"/>,
+  Wrench: () => <Icon d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>,
+  File: () => <Icon d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zM14 2v6h6M16 13H8M16 17H8M10 9H8"/>,
+  Pin: () => <Icon d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0zM12 13a3 3 0 1 0 0-6 3 3 0 0 0 0 6z"/>,
+  Refresh: () => <Icon d="M23 4v6h-6M1 20v-6h6M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>,
+  Star: () => <Icon d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>,
+  Clock: () => <Icon d="M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20zM12 6v6l4 2"/>,
+  Dollar: () => <Icon d="M12 1v22M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/>,
+  Eye: () => <Icon d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8zM12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6z"/>,
+  Grid: () => <Icon d="M3 3h7v7H3zM14 3h7v7h-7zM14 14h7v7h-7zM3 14h7v7H3z"/>,
+};
+
+// ============================================================
+// UTILITY
+// ============================================================
+const fmt = (n, dec=1) => typeof n==='number' ? n.toFixed(dec) : '0';
+const fmtRp = (n) => new Intl.NumberFormat('id-ID',{style:'currency',currency:'IDR',maximumFractionDigits:0}).format(n);
+const calcFuel = (dist, eff) => dist*eff;
+const calcCarbon = (dist, eff) => dist*eff*EMISSION_FACTOR;
+const formatTimeStr = (totalSeconds) => {
+  const m = Math.floor((totalSeconds || 0) / 60);
+  const s = (totalSeconds || 0) % 60;
+  return `${m}m ${s}s`;
+};
+
+// ============================================================
+// SPARKLINE
+// ============================================================
+const Sparkline = ({ data, color='#10b981', height=32 }) => {
+  const max = Math.max(...data, 1);
+  const min = Math.min(...data);
+  const w=100, h=height;
+  const pts = data.map((v,i)=>{
+    const x = (i/(data.length-1))*w;
+    const y = h - ((v-min)/(max-min||1))*(h-4) - 2;
+    return `${x},${y}`;
+  }).join(' ');
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} style={{width:'100%',height}} preserveAspectRatio="none">
+      <polyline points={pts} fill="none" stroke={color} strokeWidth="1.5" strokeLinejoin="round"/>
+    </svg>
+  );
+};
+
+// ============================================================
+// STATUS BADGE
+// ============================================================
+const StatusBadge = ({ status }) => {
+  const cfg = {
+    normal:   { bg:'#d1fae5', color:'#065f46', label:'Sesuai Rute',  dot:'#10b981' },
+    deviation:{ bg:'#fee2e2', color:'#991b1b', label:'Penyimpangan', dot:'#ef4444' },
+    broken:   { bg:'#fef3c7', color:'#92400e', label:'Rusak/Mogok',  dot:'#f59e0b' },
+  };
+  const c = cfg[status] || cfg.normal;
+  return (
+    <span style={{background:c.bg,color:c.color,padding:'3px 8px',borderRadius:20,fontSize:11,fontWeight:600,display:'inline-flex',alignItems:'center',gap:5}}>
+      <span style={{width:6,height:6,borderRadius:'50%',background:c.dot,display:'inline-block',animation:status==='deviation'?'ping 1s infinite':undefined}}/>
+      {c.label}
+    </span>
+  );
+};
+
+// ============================================================
+// HEALTH BAR
+// ============================================================
+const HealthBar = ({ value }) => {
+  const color = value>70?'#10b981':value>40?'#f59e0b':'#ef4444';
+  return (
+    <div style={{display:'flex',alignItems:'center',gap:8}}>
+      <div style={{flex:1,height:6,background:'#e2e8f0',borderRadius:3,overflow:'hidden'}}>
+        <div style={{width:`${value}%`,height:'100%',background:color,borderRadius:3,transition:'width 0.5s'}}/>
+      </div>
+      <span style={{fontSize:12,fontWeight:700,color,minWidth:32}}>{value}%</span>
+    </div>
+  );
+};
+
+// ============================================================
+// METRIC CARD
+// ============================================================
+const MetricCard = ({ label, value, unit, sub, color='#3b82f6', icon, trend, sparkData }) => (
+  <div style={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,padding:'16px 18px',display:'flex',flexDirection:'column',gap:8}}>
+    <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start'}}>
+      <div style={{fontSize:12,color:'#64748b',fontWeight:500,display:'flex',alignItems:'center',gap:6}}>
+        {icon && <span style={{color}}>{icon}</span>}{label}
+      </div>
+      {trend !== undefined && <span style={{fontSize:11,fontWeight:700,color:trend>0?'#10b981':'#ef4444',background:trend>0?'#d1fae5':'#fee2e2',padding:'2px 7px',borderRadius:12}}>
+        {trend>0?'↑':'↓'} {Math.abs(trend)}%
+      </span>}
+    </div>
+    <div style={{fontSize:26,fontWeight:700,color:'#0f172a',lineHeight:1}}>
+      {value}<span style={{fontSize:13,fontWeight:400,color:'#94a3b8',marginLeft:4}}>{unit}</span>
+    </div>
+    {sparkData && <Sparkline data={sparkData} color={color} height={28}/>}
+    {sub && <div style={{fontSize:11,color:'#94a3b8'}}>{sub}</div>}
+  </div>
+);
+
+// ============================================================
+// MAP VIEW
+// ============================================================
+const MapView = React.memo(({ fleets, selectedFleet, routesLoaded, mapId='map-main' }) => {
+  const mapRef = useRef(null);
+  const markersRef = useRef({});
+  const pathsRef = useRef({});
+  const initializedRef = useRef(false);
+
+  const initMap = useCallback(() => {
+    if (!window.L || initializedRef.current) return;
+    const el = document.getElementById(mapId);
+    if (!el || el._leaflet_id) return;
+    mapRef.current = window.L.map(mapId, {zoomControl:true,attributionControl:false}).setView([-6.27,106.9],12);
+    window.L.tileLayer('https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}',{maxZoom:20}).addTo(mapRef.current);
+    const tpaIcon = window.L.divIcon({className:'',html:`<div style="background:#1e293b;padding:4px 10px;border-radius:8px;color:#fff;border:2px solid #cbd5e1;font-weight:700;font-size:11px;white-space:nowrap;box-shadow:0 3px 8px rgba(0,0,0,0.3)">🏭 TPA Bantar Gebang</div>`,iconAnchor:[60,12]});
+    window.L.marker(TPA_COORD,{icon:tpaIcon}).addTo(mapRef.current);
+    initializedRef.current = true;
+  }, [mapId]);
+
+  useEffect(() => {
+    if (!document.getElementById('leaflet-css')) {
+      const link = document.createElement('link'); link.id='leaflet-css'; link.rel='stylesheet';
+      link.href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'; document.head.appendChild(link);
+    }
+    if (!document.getElementById('leaflet-js')) {
+      const script = document.createElement('script'); script.id='leaflet-js';
+      script.src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';
+      script.onload = initMap; document.head.appendChild(script);
+    } else if (window.L) { initMap(); }
+    return () => {
+      if (mapRef.current) { mapRef.current.remove(); mapRef.current=null; initializedRef.current=false; markersRef.current={}; pathsRef.current={}; }
+    };
+  }, [initMap]);
+
+  useEffect(() => {
+    if (!mapRef.current || !window.L) return;
+    const colorMap = { normal:'#10b981', deviation:'#ef4444', broken:'#f59e0b' };
+    fleets.forEach(fleet => {
+      const color = colorMap[fleet.status]||'#10b981';
+      const truckHtml = `<div style="background:${color};width:22px;height:22px;border-radius:50%;border:2.5px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,0.35);display:flex;align-items:center;justify-content:center;">
+        <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5"><rect x="1" y="3" width="15" height="13"/><path d="M16 8h4l3 3v5h-7V8z"/><circle cx="5.5" cy="18.5" r="2.5"/><circle cx="18.5" cy="18.5" r="2.5"/></svg>
+      </div>`;
+      const icon = window.L.divIcon({className:'',html:truckHtml,iconSize:[22,22],iconAnchor:[11,11]});
+      if (!markersRef.current[fleet.id]) {
+        markersRef.current[fleet.id] = window.L.marker([fleet.lat,fleet.lng],{icon}).addTo(mapRef.current)
+          .bindPopup(`<b>${fleet.plate}</b><br/>${fleet.driver}<br/><b>${fleet.speed} km/h</b>`);
+        pathsRef.current[fleet.id] = window.L.polyline(fleet.path,{color,weight:3,opacity:0.55,dashArray:'6,10'}).addTo(mapRef.current);
+      } else {
+        markersRef.current[fleet.id].setLatLng([fleet.lat,fleet.lng]);
+        markersRef.current[fleet.id].getPopup()?.setContent(`<b>${fleet.plate}</b><br/>${fleet.driver}<br/>Kecepatan: <b>${fleet.speed} km/h</b><br/>BBM: <b>${fmt(calcFuel(fleet.actualDistance,fleet.fuelEff))} L</b>`);
+        pathsRef.current[fleet.id].setLatLngs(fleet.path);
+      }
+    });
+  }, [fleets]);
+
+  useEffect(() => {
+    if (!selectedFleet || !mapRef.current || !markersRef.current[selectedFleet.id]) return;
+    mapRef.current.panTo([selectedFleet.lat,selectedFleet.lng],{animate:true,duration:0.5});
+    markersRef.current[selectedFleet.id].openPopup();
+  }, [selectedFleet]);
+
+  return (
+    <div style={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,overflow:'hidden',height:440,display:'flex',flexDirection:'column'}}>
+      <div style={{padding:'12px 16px',display:'flex',justifyContent:'space-between',alignItems:'center',borderBottom:'1px solid #f1f5f9'}}>
+        <span style={{fontWeight:700,fontSize:14,display:'flex',alignItems:'center',gap:6,color:'#0f172a'}}>
+          <Icons.Map/> Live GPS Tracker
+        </span>
+        <div style={{display:'flex',gap:8,alignItems:'center'}}>
+          {!routesLoaded && <span style={{fontSize:11,color:'#3b82f6',background:'#dbeafe',padding:'3px 10px',borderRadius:12,fontWeight:600,display:'flex',alignItems:'center',gap:5}}><Icons.Refresh/>Memuat Rute OSRM...</span>}
+          <span style={{fontSize:11,color:'#10b981',background:'#d1fae5',padding:'3px 10px',borderRadius:12,fontWeight:600}}>● GPS Aktif</span>
+        </div>
+      </div>
+      <div id={mapId} style={{flex:1}}/>
+    </div>
+  );
+});
+
+// ============================================================
+// AI CHAT PANEL
+// ============================================================
+const AIChatPanel = ({ fleets, historicalData }) => {
+  const [msgs, setMsgs] = useState([{role:'assistant',content:'Halo! Saya **EcoTrack AI Assistant**. Tanyakan apa saja tentang armada, emisi, atau efisiensi operasional Anda. Contoh: *"Armada mana yang paling boros BBM?"*'}]);
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const bottomRef = useRef(null);
+
+  const suggestions = [
+    'Armada mana yang paling boros BBM?',
+    'Berikan rekomendasi penghematan emisi',
+    'Analisis tren 30 hari terakhir',
+    'Prediksi biaya operasional bulan depan',
+  ];
+
+  const buildContext = () => {
+    const fleetSummary = fleets.map(f=>`${f.id}(${f.plate}): status=${f.status}, jarak=${fmt(f.actualDistance)}km, BBM=${fmt(calcFuel(f.actualDistance,f.fuelEff))}L, emisi=${fmt(calcCarbon(f.actualDistance,f.fuelEff))}kgCO2, health=${f.health}%`).join('\n');
+    const totFuel30 = historicalData.reduce((a,d)=>a+d.totalFuel,0);
+    const totViol = historicalData.reduce((a,d)=>a+d.violations,0);
+    return `Kamu adalah asisten AI untuk sistem manajemen armada sampah kota Jakarta "EcoTrack AI". Data real-time:\n\nARMADA:\n${fleetSummary}\n\nTPA Bantar Gebang: kapasitas=${TPA_DATA.capacity}ton, terisi=${TPA_DATA.currentLoad}ton (${((TPA_DATA.currentLoad/TPA_DATA.capacity)*100).toFixed(1)}%), antrean=${TPA_DATA.queueCount} truk, tunggu=${TPA_DATA.waitTime}mnt\n\nHistoris 30 hari: total BBM=${totFuel30}L, pelanggaran=${totViol}x, total emisi=${Math.round(totFuel30*EMISSION_FACTOR)}kgCO2, biaya BBM=${fmtRp(totFuel30*14000)}\n\nJawab dalam bahasa Indonesia, singkat, padat, dan berikan rekomendasi konkret yang actionable. Gunakan angka spesifik dari data yang ada.`;
+  };
+
+  const send = async (text) => {
+    const msg = text || input.trim();
+    if (!msg) return;
+    setInput('');
+    const newMsgs = [...msgs, {role:'user',content:msg}];
+    setMsgs(newMsgs);
+    setLoading(true);
+    try {
+      const apiKey = ""; 
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`;
+      
+      const formattedContents = newMsgs.filter(m => m.role !== 'system').map(m => ({
+        role: m.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: m.content }]
+      }));
+
+      let res;
+      let delay = 1000;
+      for(let i=0; i<5; i++) {
+        res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: formattedContents,
+            systemInstruction: { parts: [{ text: buildContext() }] }
+          })
+        });
+        if(res.ok) break;
+        await new Promise(r => setTimeout(r, delay));
+        delay *= 2;
+      }
+
+      if(!res.ok) throw new Error("API Error");
+      const data = await res.json();
+      const reply = data.candidates?.[0]?.content?.parts?.[0]?.text || 'Maaf, terjadi kesalahan atau tidak ada respons.';
+      setMsgs(p => [...p, {role:'assistant',content:reply}]);
+    } catch {
+      setMsgs(p => [...p, {role:'assistant',content:'Koneksi ke AI bermasalah. Pastikan API key tersedia dan lingkungan mengizinkan request.'}]);
+    }
+    setLoading(false);
+  };
+
+  useEffect(()=>{ bottomRef.current?.scrollIntoView({behavior:'smooth'}); },[msgs,loading]);
+
+  const renderMsg = (text) => {
+    return text.split(/(\*\*[^*]+\*\*)/g).map((part,i)=>
+      part.startsWith('**')&&part.endsWith('**')
+        ? <strong key={i}>{part.slice(2,-2)}</strong>
+        : part
+    );
+  };
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',height:'100%',background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,overflow:'hidden'}}>
+      <div style={{padding:'12px 16px',borderBottom:'1px solid #f1f5f9',display:'flex',alignItems:'center',gap:8,background:'linear-gradient(135deg,#0f172a,#1e293b)'}}>
+        <div style={{width:32,height:32,borderRadius:'50%',background:'#10b981',display:'flex',alignItems:'center',justifyContent:'center',color:'#fff'}}>
+          <Icons.Bot/>
+        </div>
+        <div>
+          <div style={{fontWeight:700,color:'#fff',fontSize:13}}>EcoTrack AI Assistant</div>
+          <div style={{fontSize:10,color:'#10b981'}}>● Online – Powered by Gemini</div>
+        </div>
+      </div>
+
+      <div style={{flex:1,overflowY:'auto',padding:16,display:'flex',flexDirection:'column',gap:12}}>
+        {msgs.map((m,i)=>(
+          <div key={i} style={{display:'flex',justifyContent:m.role==='user'?'flex-end':'flex-start'}}>
+            <div style={{maxWidth:'85%',padding:'10px 14px',borderRadius:m.role==='user'?'16px 16px 4px 16px':'16px 16px 16px 4px',background:m.role==='user'?'#0f172a':'#f8fafc',border:m.role==='user'?'none':'1px solid #e2e8f0',color:m.role==='user'?'#fff':'#0f172a',fontSize:13,lineHeight:1.6,whiteSpace:'pre-wrap'}}>
+              {renderMsg(m.content)}
+            </div>
+          </div>
+        ))}
+        {loading && (
+          <div style={{display:'flex',gap:4,padding:'10px 14px',background:'#f8fafc',border:'1px solid #e2e8f0',borderRadius:'16px 16px 16px 4px',width:'fit-content'}}>
+            {[0,1,2].map(i=><div key={i} style={{width:6,height:6,borderRadius:'50%',background:'#94a3b8',animation:`bounce 0.8s ${i*0.15}s infinite alternate`}}/>)}
+          </div>
+        )}
+        <div ref={bottomRef}/>
+      </div>
+
+      <div style={{padding:'8px 12px',borderTop:'1px solid #f1f5f9'}}>
+        <div style={{display:'flex',flexWrap:'wrap',gap:6,marginBottom:10}}>
+          {suggestions.map((s,i)=>(
+            <button key={i} onClick={()=>send(s)} style={{fontSize:10,padding:'4px 10px',borderRadius:20,border:'1px solid #e2e8f0',background:'#f8fafc',cursor:'pointer',color:'#475569',fontFamily:'inherit'}}>
+              {s}
+            </button>
+          ))}
+        </div>
+        <div style={{display:'flex',gap:8}}>
+          <input value={input} onChange={e=>setInput(e.target.value)} onKeyDown={e=>e.key==='Enter'&&!e.shiftKey&&send()} placeholder="Tanya AI tentang armada..." style={{flex:1,padding:'9px 14px',borderRadius:10,border:'1px solid #e2e8f0',fontSize:13,fontFamily:'inherit',outline:'none'}}/>
+          <button onClick={()=>send()} disabled={loading} style={{padding:'9px 14px',borderRadius:10,background:'#0f172a',color:'#fff',border:'none',cursor:'pointer',display:'flex',alignItems:'center',gap:5,fontFamily:'inherit',fontSize:13}}>
+            <Icons.Send/> Kirim
+          </button>
+        </div>
+      </div>
+      <style>{`@keyframes bounce{from{transform:translateY(0)}to{transform:translateY(-6px)}} @keyframes ping{0%,100%{opacity:1}50%{opacity:0.4}}`}</style>
+    </div>
+  );
+};
+
+// ============================================================
+// REPORT MODAL
+// ============================================================
+const ReportModal = ({ fleet, onClose }) => {
+  if (!fleet) return null;
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.5)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:9999,padding:16}} onClick={onClose}>
+      <div style={{background:'#fff',borderRadius:16,maxWidth:520,width:'100%',overflow:'hidden',boxShadow:'0 20px 60px rgba(0,0,0,0.3)'}} onClick={e=>e.stopPropagation()}>
+        <div style={{background:'linear-gradient(135deg,#dc2626,#ef4444)',padding:'16px 20px',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+          <span style={{color:'#fff',fontWeight:700,fontSize:15,display:'flex',alignItems:'center',gap:8}}><Icons.File/>Draf Laporan Pelanggaran</span>
+          <button onClick={onClose} style={{background:'transparent',border:'none',color:'#fff',cursor:'pointer'}}><Icons.X/></button>
+        </div>
+        <div style={{padding:24,fontFamily:'Georgia,serif',fontSize:13,color:'#374151'}}>
+          <div style={{textAlign:'center',marginBottom:20,paddingBottom:16,borderBottom:'1px solid #e5e7eb'}}>
+            <h3 style={{fontWeight:700,fontSize:16,textTransform:'uppercase',letterSpacing:1,margin:0}}>Dinas Lingkungan Hidup DKI Jakarta</h3>
+            <p style={{color:'#6b7280',fontSize:11,marginTop:4}}>Sistem Pengawasan Terintegrasi EcoTrack AI • {new Date().toLocaleDateString('id-ID',{day:'numeric',month:'long',year:'numeric'})}</p>
+          </div>
+          <table style={{width:'100%',borderCollapse:'collapse'}}>
+            <tbody>
+              {[['ID Armada',fleet.id],['No. Polisi',fleet.plate],['Pengemudi',fleet.driver],['Zona',fleet.zone],['Jenis Anomali','Deviasi Rute > 5 KM'],['Status','AKTIF – Butuh Tindak Lanjut']].map(([k,v])=>(
+                <tr key={k} style={{borderBottom:'1px solid #f3f4f6'}}>
+                  <td style={{padding:'8px 4px',color:'#6b7280',fontWeight:600,width:'40%'}}>{k}</td>
+                  <td style={{padding:'8px 4px',fontWeight:700,color:k==='Jenis Anomali'||k==='Status'?'#dc2626':'#111827'}}>{v}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <p style={{marginTop:16,fontSize:12,color:'#6b7280',fontStyle:'italic',lineHeight:1.7}}>Laporan ini dibuat otomatis oleh sistem AI dan membutuhkan validasi Manajer Operasional sebelum dikirim sebagai Surat Peringatan (SP-1) ke pengemudi.</p>
+        </div>
+        <div style={{padding:'12px 20px',background:'#f9fafb',display:'flex',justifyContent:'flex-end',gap:10,borderTop:'1px solid #e5e7eb'}}>
+          <button onClick={onClose} style={{padding:'9px 18px',borderRadius:8,border:'1px solid #e2e8f0',background:'#fff',cursor:'pointer',fontSize:13,fontFamily:'inherit'}}>Batal</button>
+          <button onClick={()=>{alert('Laporan SP-1 berhasil dikirim ke Pengemudi dan tercatat di Sistem SDM.');onClose();}} style={{padding:'9px 18px',borderRadius:8,background:'#0f172a',color:'#fff',border:'none',cursor:'pointer',fontSize:13,fontFamily:'inherit',display:'flex',alignItems:'center',gap:6}}>
+            <Icons.Check/> Setujui & Kirim SP-1
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ============================================================
+// VIEWS
+// ============================================================
+
+// --- DASHBOARD ---
+const DashboardView = ({ fleets, selectedFleet, setSelectedFleet, routesLoaded }) => {
+  const [reportFleet, setReportFleet] = useState(null);
+  const tpaPct = (TPA_DATA.currentLoad/TPA_DATA.capacity*100);
+  const totCarbon = fleets.reduce((a,f)=>a+calcCarbon(f.actualDistance,f.fuelEff),0);
+  const totFuel = fleets.reduce((a,f)=>a+calcFuel(f.actualDistance,f.fuelEff),0);
+  const deviations = fleets.filter(f=>f.status==='deviation');
+
+  return (
+    <div>
+      <ReportModal fleet={reportFleet} onClose={()=>setReportFleet(null)}/>
+
+      {/* KPI Row */}
+      <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12,marginBottom:20}}>
+        <MetricCard label="Armada Aktif" value={fleets.filter(f=>f.status==='normal').length} unit={`/ ${fleets.length}`} color="#10b981" icon={<Icons.Truck/>} sub="2 normal · 1 deviasi · 1 rusak"/>
+        <MetricCard label="Total BBM Terpakai" value={fmt(totFuel)} unit="Liter" color="#3b82f6" icon={<Icons.Droplet/>} sparkData={HISTORICAL.slice(-7).map(d=>d.totalFuel)}/>
+        <MetricCard label="Emisi CO₂ Hari Ini" value={fmt(totCarbon)} unit="kg" color="#f59e0b" icon={<Icons.Leaf/>} sparkData={HISTORICAL.slice(-7).map(d=>d.carbonActual)} trend={-3}/>
+        <MetricCard label="Kapasitas TPA" value={fmt(tpaPct,0)} unit="%" color={tpaPct>80?'#ef4444':'#10b981'} icon={<Icons.Chart/>} sub={`${TPA_DATA.queueCount} truk mengantre · tunggu ${TPA_DATA.waitTime} mnt`}/>
+      </div>
+
+      {/* Main Grid */}
+      <div style={{display:'grid',gridTemplateColumns:'1fr 340px',gap:16,marginBottom:16}}>
+        <MapView fleets={fleets} selectedFleet={selectedFleet} routesLoaded={routesLoaded}/>
+
+        {/* Fleet List */}
+        <div style={{display:'flex',flexDirection:'column',gap:12}}>
+          {/* TPA Status */}
+          <div style={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,padding:16}}>
+            <div style={{fontWeight:700,fontSize:13,color:'#0f172a',marginBottom:12}}>Status TPA Bantar Gebang</div>
+            <div style={{fontSize:12,color:'#64748b',marginBottom:4,display:'flex',justifyContent:'space-between'}}>
+              <span>Kapasitas</span><span style={{fontWeight:700,color:tpaPct>80?'#ef4444':'#0f172a'}}>{fmt(tpaPct,0)}%</span>
+            </div>
+            <div style={{height:8,background:'#e2e8f0',borderRadius:4,overflow:'hidden',marginBottom:12}}>
+              <div style={{height:'100%',width:`${tpaPct}%`,background:tpaPct>80?'#ef4444':'#10b981',borderRadius:4,transition:'width 1s'}}/>
+            </div>
+            <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:8}}>
+              {[['Antrean',`${TPA_DATA.queueCount} truk`,'#3b82f6'],['Tunggu',`${TPA_DATA.waitTime} mnt`,'#f59e0b'],['Terisi',`${TPA_DATA.currentLoad}t`,'#8b5cf6'],['Kapasitas',`${TPA_DATA.capacity}t`,'#10b981']].map(([l,v,c])=>(
+                <div key={l} style={{background:'#f8fafc',borderRadius:8,padding:'8px 10px',border:'1px solid #f1f5f9'}}>
+                  <div style={{fontSize:10,color:'#94a3b8',marginBottom:2}}>{l}</div>
+                  <div style={{fontWeight:700,color:c,fontSize:15}}>{v}</div>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Fleet Cards */}
+          <div style={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,overflow:'hidden',flex:1}}>
+            <div style={{padding:'10px 14px',borderBottom:'1px solid #f1f5f9',fontWeight:700,fontSize:13,color:'#0f172a'}}>Daftar Armada</div>
+            <div style={{overflowY:'auto',maxHeight:280}}>
+              {fleets.map(fleet=>(
+                <div key={fleet.id} onClick={()=>setSelectedFleet(fleet)} style={{padding:'12px 14px',borderBottom:'1px solid #f8fafc',cursor:'pointer',background:selectedFleet?.id===fleet.id?'#f0fdf4':'transparent',borderLeft:selectedFleet?.id===fleet.id?'3px solid #10b981':'3px solid transparent',transition:'all 0.15s'}}>
+                  <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:6}}>
+                    <div>
+                      <div style={{fontWeight:700,fontSize:13,color:'#0f172a'}}>{fleet.plate}</div>
+                      <div style={{fontSize:11,color:'#94a3b8'}}>{fleet.id} · {fleet.driver}</div>
+                    </div>
+                    <StatusBadge status={fleet.status}/>
+                  </div>
+                  <HealthBar value={fleet.health}/>
+                  
+                  <div style={{display:'flex',gap:10,marginTop:6}}>
+                    {[['🚛',`${fleet.speed} km/h`],['📍',`${fmt(fleet.actualDistance)} km`],['⛽',`${fmt(calcFuel(fleet.actualDistance,fleet.fuelEff))} L`]].map(([icon,v])=>(
+                      <span key={v} style={{fontSize:11,color:'#64748b',background:'#f8fafc',padding:'2px 7px',borderRadius:6}}>{icon} {v}</span>
+                    ))}
+                  </div>
+
+                  <div style={{display:'flex',gap:8,marginTop:6}}>
+                    <span style={{fontSize:10,background:'#e0e7ff',color:'#1d4ed8',padding:'2px 6px',borderRadius:4,display:'flex',alignItems:'center',gap:4}}>
+                      <Icons.Play size={10}/> Aktif: {formatTimeStr(fleet.activeTime)}
+                    </span>
+                    <span style={{fontSize:10,background:'#ffedd5',color:'#b45309',padding:'2px 6px',borderRadius:4,display:'flex',alignItems:'center',gap:4}}>
+                      <Icons.Pause size={10}/> Idle: {formatTimeStr(fleet.idleTime)}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Alerts */}
+      {deviations.length>0 && (
+        <div style={{background:'#fff',border:'1px solid #fecaca',borderLeft:'4px solid #ef4444',borderRadius:12,padding:'14px 16px'}}>
+          <div style={{fontWeight:700,fontSize:13,color:'#991b1b',marginBottom:10,display:'flex',alignItems:'center',gap:6}}><Icons.Alert/> Peringatan Aktif – Actionable Reports</div>
+          {deviations.map(f=>(
+            <div key={f.id} style={{display:'flex',justifyContent:'space-between',alignItems:'center',background:'#fef2f2',borderRadius:8,padding:'10px 14px',marginBottom:6,border:'1px solid #fecaca'}}>
+              <span style={{fontSize:13,color:'#7f1d1d'}}><strong>Anomali Rute:</strong> {f.plate} ({f.driver}) menyimpang dari rute resmi. BBM terbuang estimasi <strong>+{fmt((f.actualDistance-f.optimalDistance)*f.fuelEff)} L</strong>.</span>
+              <button onClick={()=>setReportFleet(f)} style={{padding:'7px 14px',borderRadius:8,background:'#dc2626',color:'#fff',border:'none',cursor:'pointer',fontSize:12,fontFamily:'inherit',fontWeight:600,display:'flex',alignItems:'center',gap:5,flexShrink:0,marginLeft:12}}>
+                <Icons.File/> Tindak Lanjuti
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// --- ANALYTICS ---
+const AnalyticsView = ({ fleets }) => {
+  const [chartType, setChartType] = useState('fuel');
+  const chartRef = useRef(null);
+  const chartInstance = useRef(null);
+
+  const stats = useMemo(()=>({
+    avgDailyFuel: Math.round(HISTORICAL.reduce((a,d)=>a+d.totalFuel,0)/30),
+    avgDailyCarbon: Math.round(HISTORICAL.reduce((a,d)=>a+d.carbonActual,0)/30),
+    totalViolations: HISTORICAL.reduce((a,d)=>a+d.violations,0),
+    totalCost: HISTORICAL.reduce((a,d)=>a+d.fuelCost,0),
+    maxFuelDay: HISTORICAL.reduce((a,d)=>d.totalFuel>a.totalFuel?d:a),
+    minFuelDay: HISTORICAL.reduce((a,d)=>d.totalFuel<a.totalFuel?d:a),
+    carbonSaved: HISTORICAL.reduce((a,d)=>a+(d.carbonActual-d.carbonOptimal),0),
+    avgTpaQueue: Math.round(HISTORICAL.reduce((a,d)=>a+d.tpaQueue,0)/30),
+  }),[]);
+
+  const CHART_COLORS = { trk1:'#10b981', trk2:'#ef4444', trk3:'#f59e0b', trk4:'#3b82f6', total:'#8b5cf6', actual:'#ef4444', optimal:'#10b981' };
+
+  useEffect(()=>{
+    if (!chartRef.current) return;
+    if (!window.Chart) { const s=document.createElement('script'); s.src='https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js'; s.onload=buildChart; document.head.appendChild(s); }
+    else buildChart();
+    function buildChart(){
+      if (chartInstance.current) chartInstance.current.destroy();
+      const labels = HISTORICAL.map(d=>d.shortDate);
+      let datasets;
+      if (chartType==='fuel') {
+        datasets=[
+          {label:'TRK-001',data:HISTORICAL.map(d=>d.fuel_trk1),backgroundColor:'#10b98133',borderColor:CHART_COLORS.trk1,borderWidth:2,fill:true,tension:0.4,pointRadius:0},
+          {label:'TRK-002',data:HISTORICAL.map(d=>d.fuel_trk2),backgroundColor:'#ef444433',borderColor:CHART_COLORS.trk2,borderWidth:2,fill:true,tension:0.4,pointRadius:0},
+          {label:'TRK-003',data:HISTORICAL.map(d=>d.fuel_trk3),backgroundColor:'#f59e0b33',borderColor:CHART_COLORS.trk3,borderWidth:2,fill:true,tension:0.4,pointRadius:0},
+          {label:'TRK-004',data:HISTORICAL.map(d=>d.fuel_trk4),backgroundColor:'#3b82f633',borderColor:CHART_COLORS.trk4,borderWidth:2,fill:true,tension:0.4,pointRadius:0},
+        ];
+      } else if (chartType==='carbon') {
+        datasets=[
+          {label:'Emisi Aktual (kg CO₂)',data:HISTORICAL.map(d=>d.carbonActual),backgroundColor:'#ef444422',borderColor:'#ef4444',borderWidth:2,fill:true,tension:0.4,pointRadius:0},
+          {label:'Target Optimal',data:HISTORICAL.map(d=>d.carbonOptimal),backgroundColor:'#10b98122',borderColor:'#10b981',borderWidth:2,borderDash:[5,5],fill:true,tension:0.4,pointRadius:0},
+        ];
+      } else if (chartType==='queue') {
+        datasets=[{label:'Antrean TPA (truk)',data:HISTORICAL.map(d=>d.tpaQueue),backgroundColor:'#f59e0b44',borderColor:'#f59e0b',borderWidth:2,fill:true,tension:0.4,pointRadius:0}];
+      } else {
+        datasets=[{label:'Pelanggaran Rute',data:HISTORICAL.map(d=>d.violations),backgroundColor:HISTORICAL.map(d=>d.violations>0?'#ef4444aa':'#10b98155'),borderRadius:4,type:'bar'}];
+      }
+      chartInstance.current = new window.Chart(chartRef.current,{
+        type:chartType==='violations'?'bar':'line',
+        data:{labels,datasets},
+        options:{
+          responsive:true,maintainAspectRatio:false,
+          plugins:{legend:{display:true,position:'top',labels:{boxWidth:10,padding:15,font:{size:11}}},tooltip:{mode:'index',intersect:false}},
+          scales:{x:{grid:{display:false},ticks:{maxRotation:45,font:{size:9},maxTicksLimit:10}},y:{grid:{color:'#f1f5f9'},ticks:{font:{size:10}}}},
+          interaction:{mode:'index',intersect:false},
+        }
+      });
+    }
+    return ()=>{ if(chartInstance.current){chartInstance.current.destroy();chartInstance.current=null;} };
+  },[chartType]);
+
+  const tabs = [{id:'fuel',label:'BBM per Armada'},{id:'carbon',label:'Emisi vs Target'},{id:'queue',label:'Antrean TPA'},{id:'violations',label:'Pelanggaran'}];
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',gap:16}}>
+      {/* KPIs */}
+      <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12}}>
+        <MetricCard label="Rata-rata BBM/Hari" value={stats.avgDailyFuel} unit="Liter" color="#3b82f6" icon={<Icons.Droplet/>} sparkData={HISTORICAL.slice(-14).map(d=>d.totalFuel)}/>
+        <MetricCard label="Biaya BBM 30 Hari" value={fmtRp(stats.totalCost).replace('Rp\u00a0','')} unit="IDR" color="#8b5cf6" icon={<Icons.Dollar/>} sub={`≈ ${fmtRp(stats.totalCost/30)}/hari`}/>
+        <MetricCard label="Rata-rata Emisi/Hari" value={stats.avgDailyCarbon} unit="kg CO₂" color="#f59e0b" icon={<Icons.Leaf/>} sparkData={HISTORICAL.slice(-14).map(d=>d.carbonActual)} trend={-8}/>
+        <MetricCard label="Total Pelanggaran" value={stats.totalViolations} unit="kejadian" color="#ef4444" icon={<Icons.Alert/>} sub="30 hari terakhir"/>
+      </div>
+
+      {/* Chart */}
+      <div style={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,padding:20}}>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+          <div>
+            <div style={{fontWeight:700,fontSize:15,color:'#0f172a'}}>Tren Historis 30 Hari</div>
+            <div style={{fontSize:12,color:'#64748b',marginTop:2}}>Data agregat operasional harian seluruh armada</div>
+          </div>
+          <div style={{display:'flex',gap:6}}>
+            {tabs.map(t=>(
+              <button key={t.id} onClick={()=>setChartType(t.id)} style={{padding:'6px 14px',borderRadius:8,border:'1px solid #e2e8f0',background:chartType===t.id?'#0f172a':'#f8fafc',color:chartType===t.id?'#fff':'#64748b',cursor:'pointer',fontSize:12,fontFamily:'inherit',fontWeight:chartType===t.id?600:400}}>
+                {t.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div style={{position:'relative',height:280}}>
+          <canvas ref={chartRef} role="img" aria-label="Grafik tren historis 30 hari operasional armada"/>
+        </div>
+      </div>
+
+      {/* Insight Cards */}
+      <div style={{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:12}}>
+        <div style={{background:'#0f172a',borderRadius:12,padding:20,color:'#fff'}}>
+          <div style={{fontSize:11,color:'#10b981',fontWeight:700,textTransform:'uppercase',letterSpacing:1,marginBottom:10}}>🧠 AI Pattern Detection</div>
+          <p style={{fontSize:13,lineHeight:1.7,color:'#cbd5e1',margin:0}}>Korelasi positif tinggi <strong style={{color:'#fff'}}>(r = 0.84)</strong> antara cuaca hujan di akhir pekan dengan lonjakan antrean TPA hari Senin. TRK-002 menyumbang <strong style={{color:'#ef4444'}}>42%</strong> total pemborosan karbon.</p>
+        </div>
+        <div style={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,padding:20}}>
+          <div style={{fontSize:11,color:'#3b82f6',fontWeight:700,textTransform:'uppercase',letterSpacing:1,marginBottom:10}}>📊 Peak Performance</div>
+          <div style={{fontSize:13,color:'#374151'}}>
+            <div>Hari Paling Efisien: <strong>{stats.minFuelDay.date}</strong></div>
+            <div style={{color:'#10b981',marginTop:4}}>BBM: {stats.minFuelDay.totalFuel} L · Emisi: {stats.minFuelDay.carbonOptimal} kg</div>
+            <div style={{marginTop:8}}>Hari Paling Boros: <strong>{stats.maxFuelDay.date}</strong></div>
+            <div style={{color:'#ef4444',marginTop:4}}>BBM: {stats.maxFuelDay.totalFuel} L</div>
+          </div>
+        </div>
+        <div style={{background:'#f0fdf4',border:'1px solid #bbf7d0',borderRadius:12,padding:20}}>
+          <div style={{fontSize:11,color:'#065f46',fontWeight:700,textTransform:'uppercase',letterSpacing:1,marginBottom:10}}>💰 Potensi Penghematan</div>
+          <div style={{fontSize:22,fontWeight:700,color:'#10b981',marginBottom:4}}>{fmtRp(stats.carbonSaved*1200)}</div>
+          <div style={{fontSize:12,color:'#065f46'}}>Estimasi penghematan biaya dengan mengeliminasi deviasi rute seluruh armada selama 30 hari.</div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// --- MAINTENANCE ---
+const MaintenanceView = () => (
+  <div style={{display:'flex',flexDirection:'column',gap:16}}>
+    <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12}}>
+      {[['Armada Sehat','32','#10b981'],['Perlu Perhatian','5','#f59e0b'],['Kritis / Bengkel','2','#ef4444'],['Akurasi Model AI','94.5%','#3b82f6']].map(([l,v,c])=>(
+        <MetricCard key={l} label={l} value={v} color={c}/>
+      ))}
+    </div>
+    <div style={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,overflow:'hidden'}}>
+      <div style={{padding:'14px 20px',borderBottom:'1px solid #f1f5f9',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+        <div style={{fontWeight:700,fontSize:15,color:'#0f172a',display:'flex',alignItems:'center',gap:6}}><Icons.Activity/> Predictive Maintenance – AI Score</div>
+        <span style={{fontSize:11,background:'#dbeafe',color:'#1e40af',padding:'3px 10px',borderRadius:12,fontWeight:600}}>Model ML: Gradient Boosting v2.1</span>
+      </div>
+      <div style={{padding:20,display:'flex',flexDirection:'column',gap:16}}>
+        {MAINTENANCE_DATA.map(m=>{
+          const statusColor = m.status==='good'?'#10b981':m.status==='warning'?'#f59e0b':m.status==='danger'?'#ef4444':'#7f1d1d';
+          const statusBg = m.status==='good'?'#d1fae5':m.status==='warning'?'#fef3c7':m.status==='danger'?'#fee2e2':'#fecaca';
+          return (
+            <div key={m.id} style={{border:'1px solid #f1f5f9',borderLeft:`4px solid ${statusColor}`,borderRadius:10,padding:'14px 16px'}}>
+              <div style={{display:'flex',justifyContent:'space-between',alignItems:'flex-start',marginBottom:12}}>
+                <div>
+                  <div style={{fontWeight:700,fontSize:14,color:'#0f172a'}}>{m.id} · {m.plate}</div>
+                  <div style={{fontSize:11,color:'#64748b',marginTop:2}}>Odometer: {m.mileage.toLocaleString('id-ID')} km · Servis terakhir: {m.lastService}</div>
+                </div>
+                <div style={{textAlign:'right'}}>
+                  <div style={{fontSize:11,fontWeight:700,background:statusBg,color:statusColor,padding:'4px 10px',borderRadius:12,marginBottom:4}}>{m.component}</div>
+                  <div style={{fontSize:11,color:'#94a3b8'}}>Servis berikut: {m.nextService}</div>
+                </div>
+              </div>
+              <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:12}}>
+                <div>
+                  <div style={{fontSize:11,color:'#64748b',marginBottom:4}}>Health Score</div>
+                  <HealthBar value={m.health}/>
+                </div>
+                <div>
+                  <div style={{fontSize:11,color:'#64748b',marginBottom:4}}>Probabilitas Mogok 7 Hari</div>
+                  <div style={{display:'flex',alignItems:'center',gap:8}}>
+                    <div style={{flex:1,height:6,background:'#e2e8f0',borderRadius:3,overflow:'hidden'}}>
+                      <div style={{width:`${m.prob}%`,height:'100%',background:m.prob>70?'#ef4444':m.prob>30?'#f59e0b':'#10b981',borderRadius:3}}/>
+                    </div>
+                    <span style={{fontSize:12,fontWeight:700,color:m.prob>70?'#ef4444':m.prob>30?'#f59e0b':'#10b981',minWidth:32}}>{m.prob}%</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  </div>
+);
+
+// --- CARBON ---
+const CarbonView = ({ fleets }) => {
+  const totFuel = fleets.reduce((a,f)=>a+calcFuel(f.actualDistance,f.fuelEff),0);
+  const totCarbon = fleets.reduce((a,f)=>a+calcCarbon(f.actualDistance,f.fuelEff),0);
+  const totWaste = fleets.reduce((a,f)=>{const diff=f.actualDistance-f.optimalDistance;return a+(diff>0?calcCarbon(diff,f.fuelEff):0);},0);
+  const totOptimal = fleets.reduce((a,f)=>a+calcCarbon(f.optimalDistance,f.fuelEff),0);
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',gap:16}}>
+      <div style={{display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:12}}>
+        <MetricCard label="Total BBM" value={fmt(totFuel)} unit="Liter" color="#3b82f6" icon={<Icons.Droplet/>}/>
+        <MetricCard label="Emisi Aktual" value={fmt(totCarbon)} unit="kg CO₂" color="#ef4444" icon={<Icons.Leaf/>}/>
+        <MetricCard label="Karbon Terbuang" value={fmt(totWaste)} unit="kg CO₂" color="#f59e0b" icon={<Icons.Alert/>} sub="Akibat deviasi rute"/>
+        <MetricCard label="Target Optimal" value={fmt(totOptimal)} unit="kg CO₂" color="#10b981" icon={<Icons.Check/>}/>
+      </div>
+
+      <div style={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,padding:20}}>
+        <div style={{fontWeight:700,fontSize:15,color:'#0f172a',marginBottom:16}}>Analisis Emisi & BBM per Armada</div>
+        {fleets.map(fleet=>{
+          const actual=calcCarbon(fleet.actualDistance,fleet.fuelEff);
+          const optimal=calcCarbon(fleet.optimalDistance,fleet.fuelEff);
+          const waste=actual-optimal;
+          const maxVal=Math.max(...fleets.map(f=>calcCarbon(f.actualDistance,f.fuelEff)))*1.2||1;
+          const actualFuel=calcFuel(fleet.actualDistance,fleet.fuelEff);
+          const optFuel=calcFuel(fleet.optimalDistance,fleet.fuelEff);
+          return (
+            <div key={fleet.id} style={{display:'grid',gridTemplateColumns:'140px 1fr 160px',gap:16,alignItems:'center',padding:'14px 0',borderBottom:'1px solid #f8fafc'}}>
+              <div>
+                <div style={{fontWeight:700,color:'#0f172a',fontSize:13}}>{fleet.plate}</div>
+                <div style={{fontSize:11,color:'#94a3b8'}}>{fleet.id} · {fleet.driver}</div>
+                <StatusBadge status={fleet.status}/>
+              </div>
+              <div style={{display:'flex',flexDirection:'column',gap:6}}>
+                {[{label:'Aktual',w:(actual/maxVal)*100,color:'#ef4444',val:`${fmt(actual)} kg CO₂`,fuel:`${fmt(actualFuel)} L`},
+                  {label:'Optimal',w:(optimal/maxVal)*100,color:'#10b981',val:`${fmt(optimal)} kg CO₂`,fuel:`${fmt(optFuel)} L`}].map(({label,w,color,val,fuel})=>(
+                  <div key={label} style={{display:'flex',alignItems:'center',gap:8}}>
+                    <span style={{width:44,fontSize:11,color:'#64748b',fontWeight:600}}>{label}</span>
+                    <div style={{flex:1,height:18,background:'#f1f5f9',borderRadius:4,overflow:'hidden'}}>
+                      <div style={{height:'100%',width:`${Math.min(100,w)}%`,background:color,borderRadius:4,transition:'width 0.8s',display:'flex',alignItems:'center',paddingLeft:6}}>
+                        <span style={{fontSize:9,color:'#fff',fontWeight:600,whiteSpace:'nowrap'}}>{val}</span>
+                      </div>
+                    </div>
+                    <span style={{fontSize:11,color:'#3b82f6',minWidth:36}}>{fuel}</span>
+                  </div>
+                ))}
+              </div>
+              <div style={{textAlign:'right'}}>
+                {waste>0
+                  ? <span style={{fontSize:12,fontWeight:700,color:'#dc2626',background:'#fee2e2',padding:'5px 10px',borderRadius:8}}>+{fmt(waste)} kg terbuang</span>
+                  : <span style={{fontSize:12,fontWeight:700,color:'#065f46',background:'#d1fae5',padding:'5px 10px',borderRadius:8}}>✓ Sangat Efisien</span>}
+                <div style={{fontSize:11,color:'#94a3b8',marginTop:4}}>{fmtRp(waste*1200*EMISSION_FACTOR)} biaya</div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
+// --- HISTORY PLAYBACK ---
+const HistoryView = () => {
+  const [progress, setProgress] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [histPath, setHistPath] = useState(interpolatePath(HISTORY_EVENTS.map(e=>e.coord),200));
+  const mapRef = useRef(null);
+  const markerRef = useRef(null);
+  const initRef = useRef(false);
+
+  useEffect(()=>{ fetchOSRMRoute(HISTORY_EVENTS.map(e=>e.coord),300).then(setHistPath); },[]);
+
+  useEffect(()=>{
+    if (!document.getElementById('leaflet-js')||!window.L||initRef.current) return;
+    const el=document.getElementById('map-history'); if(!el||el._leaflet_id) return;
+    mapRef.current=window.L.map('map-history').setView([-6.27,106.89],12);
+    window.L.tileLayer('https://mt1.google.com/vt/lyrs=m&x={x}&y={y}&z={z}').addTo(mapRef.current);
+    window.L.polyline(histPath,{color:'#94a3b8',weight:4,opacity:0.7}).addTo(mapRef.current);
+    HISTORY_EVENTS.forEach(evt=>{
+      const c=evt.type==='deviation'?'#ef4444':evt.type==='warning'?'#f59e0b':'#10b981';
+      window.L.marker(evt.coord,{icon:window.L.divIcon({className:'',html:`<div style="background:${c};width:14px;height:14px;border-radius:50%;border:2px solid #fff;box-shadow:0 2px 4px rgba(0,0,0,0.3)"></div>`,iconSize:[14,14]})}).addTo(mapRef.current).bindPopup(`<b>${evt.time} WIB</b><br/>${evt.title}`);
+    });
+    markerRef.current=window.L.marker(histPath[0],{icon:window.L.divIcon({className:'',html:`<div style="background:#3b82f6;width:22px;height:22px;border-radius:50%;border:2.5px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,0.3);display:flex;align-items:center;justify-content:center"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.5"><rect x="1" y="3" width="15" height="13"/><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"/></svg></div>`,iconSize:[22,22],iconAnchor:[11,11]})}).addTo(mapRef.current);
+    initRef.current=true;
+    return ()=>{ if(mapRef.current){mapRef.current.remove();mapRef.current=null;initRef.current=false;} };
+  },[]);
+
+  useEffect(()=>{ let t; if(playing){t=setInterval(()=>setProgress(p=>{if(p>=histPath.length-1){setPlaying(false);return histPath.length-1;}return p+1;}),40);} return()=>clearInterval(t); },[playing,histPath]);
+
+  useEffect(()=>{ if(markerRef.current&&histPath[progress]){markerRef.current.setLatLng(histPath[progress]); if(progress%30===0)mapRef.current?.panTo(histPath[progress],{animate:true,duration:0.4});} },[progress,histPath]);
+
+  const activeEvt = Math.min(HISTORY_EVENTS.length-1, Math.floor((progress/histPath.length)*HISTORY_EVENTS.length));
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',gap:16}}>
+      <div style={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,padding:20}}>
+        <div style={{fontWeight:700,fontSize:15,color:'#0f172a',marginBottom:4,display:'flex',alignItems:'center',gap:8}}><Icons.History/> Audit Histori Perjalanan – Playback Mode</div>
+        <div style={{fontSize:12,color:'#64748b',marginBottom:16}}>Lacak riwayat pergerakan armada TRK-002 secara detail. Data 1 hari lalu.</div>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 280px',gap:16}}>
+          <div>
+            <div id="map-history" style={{height:380,borderRadius:10,border:'1px solid #e2e8f0',overflow:'hidden',marginBottom:12}}/>
+            <div style={{display:'flex',alignItems:'center',gap:12,background:'#f8fafc',borderRadius:10,padding:12,border:'1px solid #e2e8f0'}}>
+              <button onClick={()=>setPlaying(!playing)} style={{width:40,height:40,borderRadius:'50%',background:'#3b82f6',border:'none',cursor:'pointer',display:'flex',alignItems:'center',justifyContent:'center',color:'#fff',flexShrink:0}}>
+                {playing?<Icons.Pause/>:<Icons.Play/>}
+              </button>
+              <div style={{flex:1}}>
+                <input type="range" min={0} max={histPath.length-1} value={progress} onChange={e=>{setProgress(+e.target.value);setPlaying(false);}} style={{width:'100%',marginBottom:4}}/>
+                <div style={{display:'flex',justifyContent:'space-between',fontSize:11,color:'#94a3b8'}}>
+                  <span>08:00 WIB</span>
+                  <span style={{fontWeight:700,color:'#3b82f6'}}>{Math.floor((progress/histPath.length)*100)}% selesai</span>
+                  <span>13:10 WIB</span>
+                </div>
+              </div>
+            </div>
+          </div>
+          <div style={{background:'#f8fafc',borderRadius:10,border:'1px solid #e2e8f0',padding:16,overflowY:'auto',maxHeight:460}}>
+            <div style={{fontWeight:700,fontSize:13,color:'#0f172a',marginBottom:12,paddingBottom:10,borderBottom:'1px solid #e2e8f0'}}>Timeline Peristiwa</div>
+            {HISTORY_EVENTS.map((evt,idx)=>{
+              const active=idx===activeEvt;
+              const past=idx<activeEvt;
+              const c=evt.type==='deviation'?'#ef4444':evt.type==='warning'?'#f59e0b':'#10b981';
+              return (
+                <div key={idx} style={{display:'flex',gap:10,marginBottom:16,opacity:idx>activeEvt?0.35:1,transition:'opacity 0.3s'}}>
+                  <div style={{display:'flex',flexDirection:'column',alignItems:'center',gap:2}}>
+                    <div style={{width:12,height:12,borderRadius:'50%',background:past||active?c:'#e2e8f0',border:`2px solid ${c}`,flexShrink:0,animation:active?'ping 1s infinite':undefined}}/>
+                    {idx<HISTORY_EVENTS.length-1&&<div style={{width:2,height:24,background:past?c:'#e2e8f0',transition:'background 0.3s'}}/>}
+                  </div>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:12,fontWeight:700,color:evt.type==='deviation'?'#dc2626':'#0f172a'}}>{evt.title}</div>
+                    <div style={{fontSize:10,color:'#94a3b8',fontFamily:'monospace',background:'#f1f5f9',display:'inline-block',padding:'1px 6px',borderRadius:4,marginTop:2}}>{evt.time} WIB</div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// --- IoT ANOMALY ---
+const IoTView = () => {
+  const [alertDismissed, setAlertDismissed] = useState(false);
+  const barsData = [80,85,82,88,85,40,38,35,36,35];
+  const maxBar = Math.max(...barsData);
+  return (
+    <div style={{display:'flex',flexDirection:'column',gap:16}}>
+      {!alertDismissed && (
+        <div style={{background:'#fef2f2',border:'1px solid #fecaca',borderLeft:'4px solid #ef4444',borderRadius:12,padding:'14px 16px',display:'flex',justifyContent:'space-between',alignItems:'center'}}>
+          <div style={{display:'flex',alignItems:'center',gap:10}}>
+            <span style={{fontSize:20}}>🚨</span>
+            <div>
+              <div style={{fontWeight:700,color:'#991b1b',fontSize:13}}>ANOMALI AKTIF – TRK-002 · D 5678 EF</div>
+              <div style={{fontSize:12,color:'#7f1d1d'}}>Penurunan muatan 2.5 ton terdeteksi di luar koordinat TPA resmi · Jl. Raya Bekasi KM 12 · 14:23 WIB</div>
+            </div>
+          </div>
+          <button onClick={()=>setAlertDismissed(true)} style={{padding:'7px 14px',borderRadius:8,background:'#dc2626',color:'#fff',border:'none',cursor:'pointer',fontSize:12,fontFamily:'inherit',fontWeight:600}}>Tahan Armada</button>
+        </div>
+      )}
+      <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:16}}>
+        <div style={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,padding:20}}>
+          <div style={{fontWeight:700,fontSize:14,color:'#0f172a',marginBottom:4}}>Grafik Berat Muatan Real-time</div>
+          <div style={{fontSize:11,color:'#64748b',marginBottom:16}}>Sensor IoT bak truk – 30 menit terakhir</div>
+          <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}>
+            <span style={{fontSize:10,color:'#94a3b8'}}>Berat (Ton)</span>
+            <span style={{fontSize:10,color:'#ef4444',fontWeight:700,background:'#fee2e2',padding:'2px 8px',borderRadius:10}}>⚠ ANOMALI TERDETEKSI</span>
+          </div>
+          <div style={{display:'flex',alignItems:'flex-end',gap:4,height:160,borderBottom:'1px solid #e2e8f0',borderLeft:'1px solid #e2e8f0',padding:'8px 0 0 8px',marginBottom:4,position:'relative'}}>
+            <div style={{position:'absolute',top:0,left:0,fontSize:9,color:'#94a3b8',padding:'0 0 0 10px'}}>5T</div>
+            <div style={{position:'absolute',top:'50%',left:0,fontSize:9,color:'#94a3b8',padding:'0 0 0 10px'}}>2.5T</div>
+            {barsData.map((h,i)=>(
+              <div key={i} style={{flex:1,height:`${(h/maxBar)*100}%`,background:i>=5?'#ef4444':'#10b981',borderRadius:'3px 3px 0 0',transition:'height 0.3s',opacity:0.85}}/>
+            ))}
+            {/* Anomaly annotation */}
+            <div style={{position:'absolute',top:'20%',right:'38%',fontSize:10,color:'#dc2626',fontWeight:700,background:'#fff',border:'1px solid #fecaca',padding:'2px 6px',borderRadius:4}}>← Tumpah Ilegal?</div>
+          </div>
+          <div style={{fontSize:10,color:'#94a3b8',textAlign:'center'}}>T-30 mnt ←→ Sekarang</div>
+        </div>
+        <div style={{display:'flex',flexDirection:'column',gap:12}}>
+          <div style={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,padding:16}}>
+            <div style={{fontWeight:700,fontSize:13,color:'#0f172a',marginBottom:12}}>Detail Sensor IoT</div>
+            {[['Berat Muatan Saat Ini','2.1 Ton','#ef4444'],['Berat Awal Shift','4.6 Ton','#0f172a'],['Selisih Tidak Wajar','-2.5 Ton','#dc2626'],['Suhu Mesin','92°C (Normal)','#f59e0b'],['RPM Engine','2,400 RPM','#10b981'],['Koordinat Terakhir','Jl. Raya Bekasi KM 12','#3b82f6']].map(([l,v,c])=>(
+              <div key={l} style={{display:'flex',justifyContent:'space-between',padding:'6px 0',borderBottom:'1px solid #f8fafc'}}>
+                <span style={{fontSize:12,color:'#64748b'}}>{l}</span>
+                <span style={{fontSize:12,fontWeight:700,color:c}}>{v}</span>
+              </div>
+            ))}
+          </div>
+          <button style={{padding:14,borderRadius:10,background:'#0f172a',color:'#fff',border:'none',cursor:'pointer',fontSize:13,fontFamily:'inherit',fontWeight:700,display:'flex',alignItems:'center',justifyContent:'center',gap:8}}>
+            <Icons.File/> Generate Laporan Pembuangan Ilegal
+          </button>
+          <button style={{padding:14,borderRadius:10,background:'#dc2626',color:'#fff',border:'none',cursor:'pointer',fontSize:13,fontFamily:'inherit',fontWeight:700,display:'flex',alignItems:'center',justifyContent:'center',gap:8}}>
+            <Icons.Alert/> Kirim Notifikasi ke Supervisor
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// --- SIMULATOR ---
+const SimulatorView = ({ fleets }) => {
+  const [traffic, setTraffic] = useState('Macet Parah (Jalur Utama Merah)');
+  const [weather, setWeather] = useState('Hujan Sedang');
+  const [tpa, setTpa] = useState('Sangat Padat (> 60 mnt)');
+  const [fleetCond, setFleetCond] = useState('1 Armada Rusak (TRK-003)');
+  const [loading, setLoading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [liveMode, setLiveMode] = useState(false);
+  const [fetching, setFetching] = useState(false);
+
+  const fetchLive = async () => {
+    setFetching(true);
+    try {
+      const res = await fetch('https://api.open-meteo.com/v1/forecast?latitude=-6.2088&longitude=106.8456&current_weather=true');
+      const data = await res.json();
+      const code = data.current_weather.weathercode;
+      const h = new Date().getHours();
+      setWeather(code>=71?'Hujan Badai':code>=51?'Hujan Sedang':'Cerah / Berawan');
+      setTraffic((h>=7&&h<=9)||(h>=16&&h<=19)?'Macet Parah (Jalur Utama Merah)':h>=10&&h<=15?'Padat Merayap':'Lancar');
+    } catch { setWeather('Data API Tidak Tersedia'); }
+    setFetching(false);
+  };
+
+  useEffect(()=>{ if(liveMode)fetchLive(); },[liveMode]);
+
+  const run = () => {
+    setLoading(true); setResult(null);
+    setTimeout(()=>{
+      const timeSaved = traffic.includes('Macet')&&weather.includes('Hujan')?2.2:traffic.includes('Macet')?1.5:0.8;
+      const fuelSaved = timeSaved*8.5;
+      const carbonSaved = fuelSaved*EMISSION_FACTOR;
+      setResult({ timeSaved, fuelSaved, carbonSaved, cost:fuelSaved*14000, route: traffic.includes('Macet')?'JORR 2 + Tol Becakayu':'Rute Normal Dioptimasi', fleetActive: fleetCond.includes('Rusak')?3:4 });
+      setLoading(false);
+    },2200);
+  };
+
+  return (
+    <div style={{display:'flex',flexDirection:'column',gap:16}}>
+      <div style={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,padding:24}}>
+        <div style={{fontWeight:700,fontSize:16,color:'#0f172a',marginBottom:4}}>AI Scheduling Simulator</div>
+        <div style={{fontSize:12,color:'#64748b',marginBottom:20}}>Simulasi optimasi rute dan penjadwalan berbasis multi-variabel indikator real-time.</div>
+        <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:20}}>
+          {/* Inputs */}
+          <div style={{display:'flex',flexDirection:'column',gap:14}}>
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',background:'#f8fafc',borderRadius:10,padding:'10px 14px',border:'1px solid #e2e8f0'}}>
+              <div>
+                <div style={{fontWeight:700,fontSize:13,color:'#0f172a'}}>Mode Data Live API</div>
+                <div style={{fontSize:11,color:'#64748b'}}>BMKG + Open-Meteo + Google Maps</div>
+              </div>
+              <div style={{display:'flex',alignItems:'center',gap:8}}>
+                {fetching&&<Icons.Refresh/>}
+                <div onClick={()=>setLiveMode(!liveMode)} style={{width:44,height:24,borderRadius:12,background:liveMode?'#10b981':'#cbd5e1',cursor:'pointer',position:'relative',transition:'background 0.2s'}}>
+                  <div style={{width:18,height:18,borderRadius:'50%',background:'#fff',position:'absolute',top:3,left:liveMode?23:3,transition:'left 0.2s',boxShadow:'0 1px 3px rgba(0,0,0,0.2)'}}/>
+                </div>
+              </div>
+            </div>
+            {[['Lalu Lintas',traffic,setTraffic,['Macet Parah (Jalur Utama Merah)','Padat Merayap','Lancar'],!liveMode],
+              ['Cuaca',weather,setWeather,['Hujan Badai','Hujan Sedang','Cerah / Berawan'],!liveMode],
+              ['Kondisi TPA',tpa,setTpa,['Sangat Padat (> 60 mnt)','Normal (< 30 mnt)'],true],
+              ['Kesiapan Armada',fleetCond,setFleetCond,['1 Armada Rusak (TRK-003)','Semua Beroperasi'],true],
+            ].map(([label,val,setter,opts,enabled])=>(
+              <div key={label}>
+                <div style={{fontSize:11,fontWeight:600,color:'#64748b',textTransform:'uppercase',letterSpacing:0.5,marginBottom:6}}>{label}</div>
+                {enabled
+                  ? <select value={val} onChange={e=>setter(e.target.value)} style={{width:'100%',padding:'9px 12px',borderRadius:8,border:'1px solid #e2e8f0',background:'#fff',fontSize:13,fontFamily:'inherit',color:'#0f172a'}}>
+                      {opts.map(o=><option key={o}>{o}</option>)}
+                    </select>
+                  : <div style={{padding:'9px 12px',borderRadius:8,border:'1px solid #e2e8f0',background:'#f8fafc',fontSize:13,color:'#64748b'}}>{val}</div>
+                }
+              </div>
+            ))}
+            <button onClick={run} disabled={loading||fetching} style={{padding:'12px',borderRadius:10,background:loading?'#94a3b8':'#0f172a',color:'#fff',border:'none',cursor:loading?'wait':'pointer',fontSize:14,fontFamily:'inherit',fontWeight:700,display:'flex',alignItems:'center',justifyContent:'center',gap:8,transition:'all 0.2s'}}>
+              {loading?<><span style={{width:16,height:16,border:'2px solid #fff',borderTopColor:'transparent',borderRadius:'50%',display:'inline-block',animation:'spin 0.7s linear infinite'}}/>Memproses AI Model...</>:'🚀 Jalankan Optimasi AI'}
+            </button>
+            <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+          </div>
+          {/* Result */}
+          <div style={{background:'#f8fafc',borderRadius:10,border:'1px solid #e2e8f0',padding:20,minHeight:320,display:'flex',flexDirection:'column',justifyContent:result?'flex-start':'center',alignItems:result?'stretch':'center'}}>
+            {!result&&!loading&&(
+              <div style={{textAlign:'center',color:'#94a3b8'}}>
+                <div style={{fontSize:32,marginBottom:8}}>⚙️</div>
+                <div style={{fontSize:13}}>Konfigurasikan parameter lalu jalankan optimasi AI</div>
+              </div>
+            )}
+            {loading&&(
+              <div style={{textAlign:'center',color:'#64748b'}}>
+                <div style={{width:40,height:40,border:'3px solid #e2e8f0',borderTopColor:'#10b981',borderRadius:'50%',animation:'spin 0.8s linear infinite',margin:'0 auto 12px'}}/>
+                <div style={{fontSize:13}}>Neural network memproses {result?.fleetActive||4} armada...</div>
+              </div>
+            )}
+            {result&&(
+              <div style={{display:'flex',flexDirection:'column',gap:12}}>
+                <div style={{fontWeight:700,fontSize:14,color:'#065f46',display:'flex',alignItems:'center',gap:6,marginBottom:4}}><Icons.Check/>Hasil Optimasi AI</div>
+                <div style={{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}}>
+                  {[['Waktu Hemat',`${result.timeSaved} jam`,'#3b82f6'],['BBM Hemat',`${fmt(result.fuelSaved)} L`,'#10b981'],['Emisi Hemat',`${fmt(result.carbonSaved)} kg CO₂`,'#f59e0b'],['Biaya Hemat',fmtRp(result.cost),'#8b5cf6']].map(([l,v,c])=>(
+                    <div key={l} style={{background:'#fff',border:`1px solid #e2e8f0`,borderRadius:10,padding:'12px 14px',borderTop:`3px solid ${c}`}}>
+                      <div style={{fontSize:11,color:'#64748b',marginBottom:4}}>{l}</div>
+                      <div style={{fontSize:17,fontWeight:700,color:c}}>{v}</div>
+                    </div>
+                  ))}
+                </div>
+                <div style={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:10,padding:'12px 14px'}}>
+                  <div style={{fontSize:11,color:'#64748b',marginBottom:4}}>Rute Rekomendasi</div>
+                  <div style={{fontWeight:700,color:'#0f172a',fontSize:13}}>{result.route}</div>
+                </div>
+                <div style={{background:'#d1fae5',border:'1px solid #a7f3d0',borderRadius:10,padding:'12px 14px',fontSize:12,color:'#065f46',lineHeight:1.6}}>
+                  <strong>Kesimpulan AI:</strong> Penundaan keberangkatan + rute alternatif berhasil menghemat total <strong>{result.timeSaved} jam</strong> operasional dan mencegah penumpukan di TPA secara signifikan.
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// --- LEADERBOARD ---
+const LeaderboardView = () => (
+  <div style={{display:'flex',flexDirection:'column',gap:16}}>
+    {/* Podium */}
+    <div style={{background:'#fff',border:'1px solid #e2e8f0',borderRadius:12,padding:24}}>
+      <div style={{fontWeight:700,fontSize:15,color:'#0f172a',marginBottom:20,display:'flex',alignItems:'center',gap:8}}><Icons.Trophy/> Eco-Driver Leaderboard – Gamifikasi Penghematan</div>
+      <div style={{display:'flex',alignItems:'flex-end',justifyContent:'center',gap:16,marginBottom:32,height:160}}>
+        {[LEADERBOARD[1],LEADERBOARD[0],LEADERBOARD[2]].map((p,i)=>{
+          const heights=['65%','100%','55%'];
+          const bgs=['#f1f5f9','#fefce8','#fff7ed'];
+          const borders=['#e2e8f0','#fbbf24','#fed7aa'];
+          const avatarBgs=['#64748b','#d97706','#ea580c'];
+          return (
+            <div key={p.rank} style={{textAlign:'center',flex:'0 0 120px',height:heights[i],background:bgs[i],borderRadius:'12px 12px 0 0',border:`1px solid ${borders[i]}`,display:'flex',flexDirection:'column',justifyContent:'flex-end',padding:'0 8px 12px',position:'relative'}}>
+              <div style={{position:'absolute',top:-30,left:'50%',transform:'translateX(-50%)',textAlign:'center'}}>
+                <div style={{width:44,height:44,borderRadius:'50%',background:avatarBgs[i],border:`3px solid ${borders[i]}`,display:'flex',alignItems:'center',justifyContent:'center',color:'#fff',fontWeight:700,fontSize:15,margin:'0 auto 4px'}}>{p.rank}</div>
+                <div style={{fontSize:11,fontWeight:700,color:'#374151',whiteSpace:'nowrap'}}>{p.name.split(' ')[0]}</div>
+              </div>
+              <div style={{fontSize:20,fontWeight:800,color:i===1?'#d97706':'#374151'}}>{p.score}<span style={{fontSize:11,fontWeight:400,color:'#94a3b8'}}>pts</span></div>
+              <div style={{fontSize:10,color:'#64748b'}}>{p.streak>0?`🔥 ${p.streak} hari streak`:''}</div>
+            </div>
+          );
+        })}
+      </div>
+      <table style={{width:'100%',borderCollapse:'collapse'}}>
+        <thead>
+          <tr style={{background:'#f8fafc',fontSize:11,color:'#94a3b8',textTransform:'uppercase',letterSpacing:0.5}}>
+            {['#','Pengemudi','Skor','Karbon Dihemat','Pelanggaran','Streak','Badge'].map(h=>(
+              <th key={h} style={{padding:'10px 12px',textAlign:'left',fontWeight:600}}>{h}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {LEADERBOARD.map(l=>(
+            <tr key={l.rank} style={{borderBottom:'1px solid #f1f5f9',transition:'background 0.15s'}}>
+              <td style={{padding:'12px',fontWeight:700,color:'#94a3b8'}}>#{l.rank}</td>
+              <td style={{padding:'12px',fontWeight:700,color:'#0f172a'}}>{l.name}</td>
+              <td style={{padding:'12px'}}><span style={{fontWeight:700,color:'#10b981',background:'#d1fae5',padding:'3px 10px',borderRadius:12}}>{l.score} pts</span></td>
+              <td style={{padding:'12px',fontFamily:'monospace',fontWeight:600,color:l.carbonSaved<0?'#ef4444':'#10b981'}}>{l.carbonSaved>0?'+':''}{l.carbonSaved} kg CO₂</td>
+              <td style={{padding:'12px'}}><span style={{fontSize:12,fontWeight:700,background:l.violations>0?'#fee2e2':'#d1fae5',color:l.violations>0?'#dc2626':'#065f46',padding:'3px 10px',borderRadius:12}}>{l.violations} kali</span></td>
+              <td style={{padding:'12px',fontWeight:700,color:l.streak>0?'#f59e0b':'#cbd5e1'}}>{l.streak>0?`🔥 ${l.streak}`:'–'}</td>
+              <td style={{padding:'12px',fontSize:20}}>{l.badge}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  </div>
+);
+
+// ============================================================
+// SIDEBAR
+// ============================================================
+const NAV_ITEMS = [
+  { section:'Operasional', items:[
+    { id:'dashboard', icon:Icons.Grid,    label:'Live Dashboard' },
+    { id:'history',   icon:Icons.History, label:'Trip History' },
+    { id:'iot',       icon:Icons.Wifi,    label:'IoT Anomaly' },
+  ]},
+  { section:'Analitik AI', items:[
+    { id:'simulator',    icon:Icons.Settings,  label:'AI Simulator' },
+    { id:'maintenance',  icon:Icons.Wrench,    label:'Predictive Maint.' },
+    { id:'analytics',    icon:Icons.TrendUp,   label:'Tren Historis (30H)' },
+  ]},
+  { section:'Kinerja', items:[
+    { id:'carbon',      icon:Icons.Leaf,    label:'Emisi Karbon' },
+    { id:'leaderboard', icon:Icons.Trophy,  label:'Eco-Leaderboard' },
+    { id:'ai',          icon:Icons.Bot,     label:'AI Assistant' },
+  ]},
+];
+
+const Sidebar = ({ active, setActive, alerts }) => (
+  <div style={{width:220,background:'#0f172a',color:'#fff',display:'flex',flexDirection:'column',height:'100vh',position:'fixed',left:0,top:0,overflowY:'auto',overflowX:'hidden',zIndex:100}}>
+    <div style={{padding:'20px 16px',borderBottom:'1px solid #1e293b',display:'flex',alignItems:'center',gap:10}}>
+      <div style={{width:36,height:36,background:'#10b981',borderRadius:10,display:'flex',alignItems:'center',justifyContent:'center',flexShrink:0}}>
+        <Icons.Leaf/>
+      </div>
+      <div>
+        <div style={{fontWeight:800,fontSize:15,letterSpacing:-0.5}}>EcoTrack AI</div>
+        <div style={{fontSize:10,color:'#4ade80',fontWeight:600}}>● Smart Fleet Management</div>
+      </div>
+    </div>
+    <nav style={{flex:1,padding:'12px 10px'}}>
+      {NAV_ITEMS.map(group=>(
+        <div key={group.section} style={{marginBottom:20}}>
+          <div style={{fontSize:9,fontWeight:700,color:'#4b5563',textTransform:'uppercase',letterSpacing:1.5,padding:'4px 6px',marginBottom:4}}>{group.section}</div>
+          {group.items.map(item=>{
+            const Ic = item.icon;
+            const isActive=active===item.id;
+            return (
+              <button key={item.id} onClick={()=>setActive(item.id)} style={{width:'100%',display:'flex',alignItems:'center',gap:10,padding:'9px 10px',borderRadius:8,border:'none',background:isActive?'#10b981':'transparent',color:isActive?'#fff':'#94a3b8',cursor:'pointer',fontSize:12,fontFamily:'inherit',fontWeight:isActive?700:400,marginBottom:2,transition:'all 0.15s',textAlign:'left',position:'relative'}}>
+                <Ic/>
+                {item.label}
+                {item.id==='iot'&&alerts>0&&<span style={{position:'absolute',right:8,background:'#ef4444',color:'#fff',width:16,height:16,borderRadius:'50%',fontSize:10,fontWeight:700,display:'flex',alignItems:'center',justifyContent:'center'}}>{alerts}</span>}
+                {item.id==='ai'&&<span style={{position:'absolute',right:8,fontSize:8,background:'#10b981',color:'#fff',padding:'1px 5px',borderRadius:8,fontWeight:700}}>NEW</span>}
+              </button>
+            );
+          })}
+        </div>
+      ))}
+    </nav>
+    <div style={{padding:'12px 16px',borderTop:'1px solid #1e293b',fontSize:11,color:'#4b5563'}}>
+      <div style={{fontWeight:600,color:'#6b7280',marginBottom:2}}>EcoTrack AI v3.2.0</div>
+      <div>Jakarta Smart City Platform</div>
+    </div>
+  </div>
+);
+
+// ============================================================
+// TOPBAR
+// ============================================================
+const TITLES = { dashboard:'Live Monitoring & Supervision', history:'Trip History Playback', iot:'IoT Anomaly Detection', simulator:'AI Scheduling Simulator', maintenance:'Predictive Maintenance', analytics:'Tren Historis & Analitik (30 Hari)', carbon:'Laporan Emisi Karbon', leaderboard:'Eco-Driver Leaderboard', ai:'AI Fleet Assistant' };
+
+const Topbar = ({ active, time }) => (
+  <header style={{background:'#fff',borderBottom:'1px solid #e2e8f0',height:56,display:'flex',alignItems:'center',justifyContent:'space-between',padding:'0 24px',position:'sticky',top:0,zIndex:50,flexShrink:0}}>
+    <h2 style={{fontSize:16,fontWeight:700,color:'#0f172a',margin:0}}>{TITLES[active]||'EcoTrack AI'}</h2>
+    <div style={{display:'flex',alignItems:'center',gap:16}}>
+      <span style={{fontSize:12,color:'#64748b',display:'flex',alignItems:'center',gap:5}}><Icons.Clock/>{time}</span>
+      <span style={{fontSize:12,display:'flex',alignItems:'center',gap:6,background:'#d1fae5',color:'#065f46',padding:'4px 12px',borderRadius:20,fontWeight:600}}>
+        <span style={{width:6,height:6,background:'#10b981',borderRadius:'50%',display:'inline-block',animation:'ping2 1.5s infinite'}}/>
+        Sistem Online
+      </span>
+    </div>
+    <style>{`@keyframes ping2{0%,100%{opacity:1}50%{opacity:0.5}}`}</style>
+  </header>
+);
+
+// ============================================================
+// APP ROOT
+// ============================================================
+export default function App() {
+  const [active, setActive] = useState('dashboard');
+  const [fleets, setFleets] = useState(INITIAL_FLEETS);
+  const [selected, setSelected] = useState(null);
+  const [time, setTime] = useState(new Date().toLocaleTimeString('id-ID'));
+  const [routesLoaded, setRoutesLoaded] = useState(false);
+  const animRef = useRef(null);
+
+  // Load real OSRM routes
+  useEffect(()=>{
+    let mounted=true;
+    (async()=>{
+      const updated = await Promise.all(INITIAL_FLEETS.map(async f=>{
+        const path = await fetchOSRMRoute(f.waypoints,300);
+        return {...f, path, lat:path[0][0], lng:path[0][1], progress:0};
+      }));
+      if(mounted){setFleets(updated);setRoutesLoaded(true);}
+    })();
+    return()=>{mounted=false;};
+  },[]);
+
+  // Animation loop with Active/Idle time calculation
+  useEffect(()=>{
+    if(!routesLoaded)return;
+    const tick=()=>{
+      setTime(new Date().toLocaleTimeString('id-ID'));
+      setFleets(prev=>prev.map(f=>{
+        // Update idle and active metrics tracking
+        const isIdle = f.status === 'broken' || f.progress >= f.path.length - 1 || f.speed === 0;
+        const newActiveTime = (f.activeTime || 0) + (isIdle ? 0 : 1);
+        const newIdleTime = (f.idleTime || 0) + (isIdle ? 1 : 0);
+
+        if(isIdle) return { ...f, speed: 0, activeTime: newActiveTime, idleTime: newIdleTime };
+
+        const np=Math.min(f.progress+1,f.path.length-1);
+        const dist=(np/f.path.length)*f.optimalDistance*(f.status==='deviation'?1.55:1.0);
+        return {
+          ...f, 
+          progress: np, 
+          lat: f.path[np][0], 
+          lng: f.path[np][1], 
+          actualDistance: parseFloat(dist.toFixed(2)),
+          activeTime: newActiveTime,
+          idleTime: newIdleTime
+        };
+      }));
+      animRef.current=setTimeout(tick,1000);
+    };
+    animRef.current=setTimeout(tick,1000);
+    return()=>clearTimeout(animRef.current);
+  },[routesLoaded]);
+
+  const iotAlerts = fleets.filter(f=>f.status==='deviation').length;
+
+  return (
+    <div style={{display:'flex',height:'100vh',background:'#f8fafc',fontFamily:'-apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif'}}>
+      <Sidebar active={active} setActive={setActive} alerts={iotAlerts}/>
+      <div style={{marginLeft:220,flex:1,display:'flex',flexDirection:'column',overflow:'hidden'}}>
+        <Topbar active={active} time={time}/>
+        <main style={{flex:1,overflowY:'auto',padding:20}}>
+          <div style={{maxWidth:1200,margin:'0 auto'}}>
+            {active==='dashboard'   && <DashboardView fleets={fleets} selectedFleet={selected} setSelectedFleet={setSelected} routesLoaded={routesLoaded}/>}
+            {active==='history'     && <HistoryView/>}
+            {active==='iot'         && <IoTView/>}
+            {active==='simulator'   && <SimulatorView fleets={fleets}/>}
+            {active==='maintenance' && <MaintenanceView/>}
+            {active==='analytics'   && <AnalyticsView fleets={fleets}/>}
+            {active==='carbon'      && <CarbonView fleets={fleets}/>}
+            {active==='leaderboard' && <LeaderboardView/>}
+            {active==='ai'          && (
+              <div style={{height:'calc(100vh - 120px)'}}>
+                <AIChatPanel fleets={fleets} historicalData={HISTORICAL}/>
+              </div>
+            )}
+          </div>
+        </main>
+      </div>
+    </div>
+  );
+}
